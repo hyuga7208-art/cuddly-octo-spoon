@@ -154,6 +154,14 @@ table.angles { width: 100%; border-collapse: collapse; background: var(--surface
 .tips li::marker { color: var(--court); }
 .note { margin: 0; font-size: 13px; color: var(--muted); max-width: 42em; border-left: 3px solid var(--ball); padding-left: 10px; }
 footer { font-size: 12px; color: var(--muted); }
+
+details.diag { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
+details.diag summary { cursor: pointer; font-weight: 700; font-size: 15px; }
+.diag-body { display: flex; flex-wrap: wrap; gap: 14px 18px; margin-top: 12px; align-items: flex-start; }
+.diag-body canvas { width: 120px; height: 120px; border-radius: 8px; background: var(--stage); flex: none; image-rendering: pixelated; }
+.diag-list { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 13px; min-width: 0; flex: 1 1 200px; }
+.diag-list dt { color: var(--muted); }
+.diag-list dd { margin: 0; overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
@@ -241,6 +249,20 @@ footer { font-size: 12px; color: var(--muted); }
     </div>
   </section>
 
+  <details class="diag" id="diag">
+    <summary>うまく検出されないとき（動作の確認）</summary>
+    <div class="diag-body">
+      <canvas id="diagInput" width="192" height="192" aria-label="AIに渡している画像"></canvas>
+      <dl class="diag-list">
+        <dt>計算方法</dt><dd id="diagBackend">確認中</dd>
+        <dt>動作チェック</dt><dd id="diagCheck">確認中</dd>
+        <dt>一番高いスコア</dt><dd class="num" id="diagScore">—</dd>
+        <dt>映像サイズ</dt><dd class="num" id="diagSize">—</dd>
+      </dl>
+    </div>
+    <p class="hint" style="margin-top:10px">左の四角は、AIに実際に渡している画像です。ここに人が映っていないときは映像の取り込みに、映っているのにスコアが低いときは計算に問題があります。</p>
+  </details>
+
   <section class="panel" aria-labelledby="tipsHead">
     <h2 id="tipsHead">うまく測るコツ</h2>
     <ul class="tips">
@@ -265,6 +287,9 @@ footer { font-size: 12px; color: var(--muted); }
   const MIN_SCORE = 0.3;
   const INPUT = 192;
   const LIVE_WINDOW = 10;         // seconds shown on the chart in camera mode
+  const WASM_BASE = 'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/';
+  const HEATMAP_NODE = 'StatefulPartitionedCall/Sigmoid';   // keypoint heatmaps, 48x48x17
+  const BACKEND_NAME = { webgl: 'GPU（WebGL）', wasm: 'WASM', cpu: 'CPU（低速）' };
   const EDGES = [
     [0,1,'c'],[0,2,'c'],[1,3,'c'],[2,4,'c'],
     [5,6,'c'],[11,12,'c'],
@@ -310,6 +335,8 @@ footer { font-size: 12px; color: var(--muted); }
   const inCanvas = document.createElement('canvas');
   inCanvas.width = INPUT; inCanvas.height = INPUT;
   const inCtx = inCanvas.getContext('2d', { willReadFrequently: true });
+  const diagCtx = $('diagInput').getContext('2d');
+  const diagScore = $('diagScore'), diagSize = $('diagSize'), diagBackend = $('diagBackend'), diagCheck = $('diagCheck');
 
   let model = null;
   let mode = 'demo';              // demo | camera | video | photo
@@ -376,27 +403,75 @@ footer { font-size: 12px; color: var(--muted); }
     throw new Error('TensorFlow.js を読み込めませんでした');
   }
 
+  async function loadWasmBackend() {
+    if (!(tf.wasm && tf.wasm.setWasmPaths)) {
+      await new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = WASM_BASE + 'tf-backend-wasm.min.js';
+        s.onload = resolve; s.onerror = () => reject(new Error('WASMを読み込めませんでした'));
+        document.head.appendChild(s);
+      });
+    }
+    tf.wasm.setWasmPaths(WASM_BASE);
+  }
+
+  // A fixed, smooth test picture. Every backend should give the same heatmaps for it as the CPU does.
+  function testInput() {
+    const a = new Int32Array(INPUT * INPUT * 3);
+    for (let y = 0, i = 0; y < INPUT; y++) for (let x = 0; x < INPUT; x++) for (let c = 0; c < 3; c++, i++) {
+      a[i] = Math.round(127.5 + 127.5 * Math.sin((x * 0.11 + y * 0.07) * (c + 1) + c * 1.3));
+    }
+    return tf.tensor4d(a, [1, INPUT, INPUT, 3], 'int32');
+  }
+  async function heatmaps(m) {
+    const inp = testInput();
+    const out = m.execute(inp, HEATMAP_NODE);
+    const d = await out.data();
+    inp.dispose(); out.dispose();
+    return d;
+  }
+  function maxDiff(a, b) { let m = 0; for (let i = 0; i < a.length; i++) m = Math.max(m, Math.abs(a[i] - b[i])); return m; }
+
   async function loadModel() {
     await loadTf();
-    let backend = 'webgl';
-    try { if (!(await tf.setBackend('webgl'))) { await tf.setBackend('cpu'); backend = 'cpu'; } }
-    catch (e) { await tf.setBackend('cpu'); backend = 'cpu'; }
-    await tf.ready();
+    setStatus('busy', 'AIモデルを読み込んでいます（約6MB）');
     const res = await fetch('movenet-lightning.json');
     if (!res.ok) throw new Error('モデルファイル（movenet-lightning.json）が見つかりません');
     const j = await res.json();
     const bin = atob(j.weightDataB64);
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    model = await tf.loadGraphModel(tf.io.fromMemory({
-      modelTopology: j.modelTopology, weightSpecs: j.weightSpecs, weightData: bytes.buffer,
+    const artifacts = () => tf.io.fromMemory({
+      modelTopology: j.modelTopology, weightSpecs: j.weightSpecs, weightData: bytes.buffer.slice(0),
       format: j.format, generatedBy: j.generatedBy, convertedBy: j.convertedBy, signature: j.signature
-    }));
-    const warm = tf.zeros([1, INPUT, INPUT, 3], 'int32');
-    const out = model.execute(warm);
-    await out.data();
-    warm.dispose(); out.dispose();
-    return backend;
+    });
+
+    // Reference result on the CPU (slow but exact), then pick the fastest backend that matches it
+    setStatus('busy', '動作チェックをしています（数秒かかります）');
+    await tf.setBackend('cpu'); await tf.ready();
+    const cpuModel = await tf.loadGraphModel(artifacts());
+    const ref = await heatmaps(cpuModel);
+    const notes = [];
+    for (const be of ['webgl', 'wasm']) {
+      try {
+        if (be === 'wasm') await loadWasmBackend();
+        if (!(await tf.setBackend(be))) { notes.push(BACKEND_NAME[be] + '：使えません'); continue; }
+        await tf.ready();
+        const m = await tf.loadGraphModel(artifacts());
+        const diff = maxDiff(await heatmaps(m), ref);
+        if (diff < 0.03) {
+          model = m; cpuModel.dispose();
+          notes.push(BACKEND_NAME[be] + '：OK（誤差 ' + diff.toFixed(4) + '）');
+          return { backend: be, notes };
+        }
+        notes.push(BACKEND_NAME[be] + '：計算結果がずれる（誤差 ' + diff.toFixed(3) + '）');
+        m.dispose();
+      } catch (e) { notes.push(BACKEND_NAME[be] + '：' + (e && e.message ? e.message : e)); }
+    }
+    await tf.setBackend('cpu'); await tf.ready();
+    model = cpuModel;
+    notes.push('CPUで動かします');
+    return { backend: 'cpu', notes };
   }
 
   // region: square {x, y, size} in source pixels; drawn into the 192x192 model input
@@ -422,12 +497,23 @@ footer { font-size: 12px; color: var(--muted); }
       const k = INPUT / r.size;
       inCtx.drawImage(src, ix0, iy0, ix1 - ix0, iy1 - iy0, (ix0 - r.x) * k, (iy0 - r.y) * k, (ix1 - ix0) * k, (iy1 - iy0) * k);
     }
-    const input = tf.tidy(() => tf.browser.fromPixels(inCanvas).toInt().expandDims(0));
+    // Read the pixels ourselves instead of tf.browser.fromPixels: it behaves the same on every browser
+    const px = inCtx.getImageData(0, 0, INPUT, INPUT).data;
+    const rgb = new Int32Array(INPUT * INPUT * 3);
+    for (let i = 0, j = 0; i < px.length; i += 4, j += 3) { rgb[j] = px[i]; rgb[j + 1] = px[i + 1]; rgb[j + 2] = px[i + 2]; }
+    diagCtx.drawImage(inCanvas, 0, 0);
+    const input = tf.tensor4d(rgb, [1, INPUT, INPUT, 3], 'int32');
     const out = model.execute(input);
     const d = await out.data();
     input.dispose(); out.dispose();
     const kps = [];
-    for (let i = 0; i < 17; i++) kps.push({ x: r.x + d[i * 3 + 1] * r.size, y: r.y + d[i * 3] * r.size, s: d[i * 3 + 2] });
+    let best = 0;
+    for (let i = 0; i < 17; i++) {
+      kps.push({ x: r.x + d[i * 3 + 1] * r.size, y: r.y + d[i * 3] * r.size, s: d[i * 3 + 2] });
+      best = Math.max(best, d[i * 3 + 2]);
+    }
+    diagScore.textContent = best.toFixed(2) + '（' + MIN_SCORE + '以上で表示）';
+    diagSize.textContent = Math.round(w) + ' × ' + Math.round(h);
     return kps;
   }
 
@@ -936,10 +1022,13 @@ footer { font-size: 12px; color: var(--muted); }
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { render(lastKps); drawChart(); });
 
   setInputsEnabled(false);
-  loadModel().then(backend => {
+  loadModel().then(({ backend, notes }) => {
+    diagBackend.textContent = BACKEND_NAME[backend];
+    diagCheck.textContent = notes.join(' ／ ');
     setInputsEnabled(true);
-    setStatus('ready', '準備完了' + (backend === 'cpu' ? '（GPUが使えないため低速モード）' : '') + '・カメラ・動画・写真のどれかを選んでください');
+    setStatus('ready', '準備完了' + (backend === 'cpu' ? '（低速モード）' : '') + '・カメラ・動画・写真のどれかを選んでください');
   }).catch(e => {
+    diagCheck.textContent = e && e.message ? e.message : String(e);
     setStatus('error', 'AIモデルを読み込めませんでした：' + (e && e.message ? e.message : e));
   });
 })();
